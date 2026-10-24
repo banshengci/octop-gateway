@@ -850,6 +850,34 @@ class BaseChannel(ABC):
             logger.info("Duplicate inbound ignored (scope=%s key=%s)", scope, key)
         return duplicate
 
+    def has_seen(self, key: str, *, scope: str | None = None) -> bool:
+        """Read-only variant of :meth:`is_duplicate` — check without recording.
+
+        Use this when a channel needs to know whether an event was handled
+        before, but must not claim the key (for example: deciding whether an
+        edited message refers to a source message you already processed).
+
+        Fail-open in the same direction as :meth:`is_duplicate`: if the store is
+        unavailable this returns False, so the caller processes the message
+        rather than silently dropping it.
+        """
+        if not key:
+            return False
+        scope = scope or self.channel_type
+        if scope + "\x00" + key in self._dedup_recent:
+            return True
+        try:
+            with _dedup_lock:
+                conn = _get_dedup_store()
+                hit = conn.execute(
+                    "SELECT 1 FROM inbound_seen WHERE scope = ? AND key = ? AND seen_at >= ?",
+                    (scope, key, time.time() - _DEDUP_TTL_SECONDS),
+                ).fetchone()
+            return hit is not None
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Inbound dedup store unavailable (scope=%s), failing open", scope)
+            return False
+
     async def handle_inbound(self, raw_payload: object) -> None:
         """Run the shared inbound template around platform-specific delivery.
 

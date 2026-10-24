@@ -10,7 +10,6 @@ import platform
 import re
 import time
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -253,7 +252,6 @@ class XiaoyiChannel(BaseChannel):
         self._connection_session: str | None = None
         self._session_server_map: dict[str, str] = {}
         self._session_task_map: dict[str, str] = {}
-        self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
         self._reconnect_tasks: set[asyncio.Task[None]] = set()
 
     def _default_constraints(self) -> ChannelConstraints:
@@ -375,7 +373,7 @@ class XiaoyiChannel(BaseChannel):
 
         self._session_task_map[session_id] = task_id  # type: ignore[assignment]
         msg_id = str(message.get("id") or uuid.uuid4())
-        if self._is_duplicate(msg_id):
+        if self.is_duplicate(msg_id):
             return
 
         text_parts: list[str] = []
@@ -409,16 +407,6 @@ class XiaoyiChannel(BaseChannel):
             "content": content_parts,
         }
         self.enqueue(native)
-
-    def _is_duplicate(self, msg_id: str) -> bool:
-        if not msg_id:
-            return False
-        if msg_id in self._seen_message_ids:
-            return True
-        self._seen_message_ids[msg_id] = time.time()
-        while len(self._seen_message_ids) > 1000:
-            self._seen_message_ids.popitem(last=False)
-        return False
 
     async def _process_inbound(self, message: InboundMessage, subject: ChannelSubject) -> bool:
         """Process a prepared inbound turn with A2A artifact streaming."""

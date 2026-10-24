@@ -254,6 +254,13 @@ class DingTalkChannel(BaseChannel):
         if not self._running:
             return
 
+        # Idempotency: the stream callback can deliver the same message twice.
+        # BaseChannel.is_duplicate persists the id, so a redelivery hours later
+        # (or after a restart) is still recognised.
+        msg_id = raw_payload.get("msg_id")
+        if msg_id and self.is_duplicate(str(msg_id)):
+            return
+
         if self._enqueue_callback:
             self._enqueue_callback(raw_payload)
         else:

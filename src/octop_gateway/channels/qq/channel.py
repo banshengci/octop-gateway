@@ -15,7 +15,6 @@ import logging
 import re
 import threading
 import time
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Self
 
@@ -157,9 +156,6 @@ _C2C_STREAM_HOLD = "\n"
 _API_BASE = "https://api.sgroup.qq.com"
 _SANDBOX_API_BASE = "https://sandbox.api.sgroup.qq.com"
 _GATEWAY_PATH = "/gateway/bot"
-
-# Deduplication window size
-_DEDUP_MAX_SIZE = 1000
 
 # ---------------------------------------------------------------------------
 # Module-level msg_seq counter (per msg_id)
@@ -311,7 +307,6 @@ class QQChannel(BaseChannel):
         self._max_reconnect_delay: float = 60.0
 
         # Deduplication: ordered dict acting as LRU cache
-        self._seen_message_ids: OrderedDict[str, float] = OrderedDict()
 
         # OAuth access token state
         self._access_token: str | None = None
@@ -1362,25 +1357,12 @@ class QQChannel(BaseChannel):
 
         # Deduplication check
         msg_id = data.get("id", "")
-        if msg_id and self._is_duplicate(msg_id):
+        if msg_id and self.is_duplicate(msg_id):
             logger.debug("QQChannel skipping duplicate message: %s", msg_id)
             return
 
         # Enqueue for processing
         self.enqueue(full_payload)
-
-    def _is_duplicate(self, msg_id: str) -> bool:
-        """Check and record message ID for deduplication."""
-        if msg_id in self._seen_message_ids:
-            return True
-
-        self._seen_message_ids[msg_id] = time.time()
-
-        # Evict oldest entries when exceeding max size
-        while len(self._seen_message_ids) > _DEDUP_MAX_SIZE:
-            self._seen_message_ids.popitem(last=False)
-
-        return False
 
     # =========================================================================
     # Internal: REST API

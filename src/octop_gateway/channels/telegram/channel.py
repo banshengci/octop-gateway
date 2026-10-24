@@ -128,8 +128,6 @@ class TelegramChannel(BaseChannel):
         )
         self._bot_id: int | None = None
         self._bot_username: str | None = None
-        self._seen_updates: OrderedDict[str, None] = OrderedDict()
-        self._seen_messages: OrderedDict[str, None] = OrderedDict()
         self._passive_albums: OrderedDict[tuple[str, str, str, str], tuple[float, list[Any]]] = OrderedDict()
         self._files: OrderedDict[str, tuple[str, str]] = OrderedDict()
         self._albums: dict[tuple[str, str, str, str], list[Any]] = {}
@@ -215,8 +213,6 @@ class TelegramChannel(BaseChannel):
         await asyncio.gather(*self._album_tasks, *self._active.values(), return_exceptions=True)
         self._albums.clear()
         self._files.clear()
-        self._seen_updates.clear()
-        self._seen_messages.clear()
         self._passive_albums.clear()
         self.interactions.pending.clear()
         if self._app:
@@ -227,16 +223,6 @@ class TelegramChannel(BaseChannel):
             self._app = None
         self._connection_session = None
         logger.info("TelegramChannel stopped")
-
-    def _is_duplicate(self, key: str) -> bool:
-        # Independent FIFO windows: update churn cannot evict source IDs.
-        seen = self._seen_messages if key.startswith("message:") else self._seen_updates
-        if key in seen:
-            return True
-        seen[key] = None
-        while len(seen) > 1000:
-            seen.popitem(last=False)
-        return False
 
     def _is_allowed_sender(self, message: Any) -> bool:
         allowed = self._config.allowed_user_ids
@@ -262,7 +248,7 @@ class TelegramChannel(BaseChannel):
 
     async def _handle_update(self, update: Any) -> None:
         update_id = getattr(update, "update_id", None)
-        if update_id is not None and self._is_duplicate(f"update:{update_id}"):
+        if update_id is not None and self.is_duplicate(f"update:{update_id}"):
             return
         message = getattr(update, "message", None) or getattr(update, "edited_message", None)
         if not message:
@@ -272,7 +258,7 @@ class TelegramChannel(BaseChannel):
             # Commands on previously unseen edited messages are rejected too.
             if not self._config.edited_messages or (message.text or message.caption or "").lstrip().startswith("/"):
                 return
-            if f"message:{message.chat.id}:{message.message_id}" in self._seen_messages:
+            if self.has_seen(f"message:{message.chat.id}:{message.message_id}"):
                 return
         group = getattr(message, "media_group_id", None)
         if group and self._config.albums:
@@ -380,7 +366,7 @@ class TelegramChannel(BaseChannel):
         return await self._build_message(message, edited=bool(getattr(update, "edited_message", None)))
 
     async def _build_message(self, message: Any, *, edited: bool = False) -> dict[str, Any] | None:
-        if self._is_duplicate(f"message:{message.chat.id}:{message.message_id}"):
+        if self.is_duplicate(f"message:{message.chat.id}:{message.message_id}"):
             return None
         return await self._extract_message(message, edited=edited)
 

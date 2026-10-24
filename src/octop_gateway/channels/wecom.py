@@ -705,6 +705,11 @@ class WeComChannel(BaseChannel):
             logger.debug("WeComChannel ignoring msgtype=%s", msg_type)
             return
 
+        # Idempotency: WeCom can redeliver the same msgid.
+        msg_id = body.get("msgid")
+        if msg_id and self.is_duplicate(str(msg_id)):
+            return
+
         # Enqueue body with frame reference for reply routing
         payload = dict(body)
         payload["_frame"] = frame
