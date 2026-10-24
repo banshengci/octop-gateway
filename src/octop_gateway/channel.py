@@ -13,9 +13,13 @@ import binascii
 import hashlib
 import logging
 import mimetypes
+import os
 import re
+import sqlite3
+import threading
 import time
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, fields
 from typing import Any, Self
@@ -51,6 +55,73 @@ logger = logging.getLogger(__name__)
 
 # Type alias for the message processor: takes InboundMessage, yields MessageEvents
 MessageProcessor = Callable[[InboundMessage], AsyncIterator[MessageEvent]]
+
+
+# ---------------------------------------------------------------------------
+# Inbound idempotency — shared by every channel
+# ---------------------------------------------------------------------------
+#
+# IM platforms deliver inbound events at least once. Feishu, for example, retries
+# an unacknowledged push on a 20s / 5min / 1h / 6h ladder (≈7h05m cumulative) and
+# the retry carries the *same* message id. A per-process cache is not enough:
+# any restart inside that window forgets the id and the whole turn runs again,
+# re-executing side-effecting tool calls.
+#
+# Each channel used to keep its own in-memory OrderedDict (feishu 2000, discord
+# 1000) and some channels had no dedup at all. This is now a single persisted
+# store on the base class so every channel — present and future — shares the
+# same guarantee.
+
+_DEDUP_DB_PATH = os.environ.get(
+    "OCTOP_INBOUND_DEDUP_DB", os.path.expanduser("~/.octop/inbound-dedup.sqlite")
+)
+# Must exceed the longest upstream retry window (Feishu ≈7h05m).
+_DEDUP_TTL_SECONDS = int(os.environ.get("OCTOP_INBOUND_DEDUP_TTL", str(8 * 3600)))
+# Per-instance fast path; the store is the authority.
+_DEDUP_RECENT_SIZE = 2000
+_DEDUP_SWEEP_INTERVAL = 600.0
+
+_dedup_lock = threading.Lock()
+_dedup_conn: sqlite3.Connection | None = None
+_dedup_last_sweep = 0.0
+
+
+def _get_dedup_store() -> sqlite3.Connection:
+    """Open (once per process) the shared inbound-idempotency store."""
+    global _dedup_conn
+    if _dedup_conn is not None:
+        return _dedup_conn
+    parent = os.path.dirname(_DEDUP_DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(_DEDUP_DB_PATH, check_same_thread=False, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS inbound_seen ("
+        "scope TEXT NOT NULL, key TEXT NOT NULL, seen_at REAL NOT NULL, "
+        "PRIMARY KEY (scope, key))"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_inbound_seen_at ON inbound_seen(seen_at)")
+    conn.commit()
+    _dedup_conn = conn
+    logger.info("Inbound dedup store ready: %s (ttl=%ss)", _DEDUP_DB_PATH, _DEDUP_TTL_SECONDS)
+    return conn
+
+
+def _sweep_dedup(now: float) -> None:
+    """Drop ids older than the retry window. Runs at most once per 10 minutes."""
+    global _dedup_last_sweep
+    if now - _dedup_last_sweep < _DEDUP_SWEEP_INTERVAL:
+        return
+    _dedup_last_sweep = now
+    try:
+        conn = _get_dedup_store()
+        cur = conn.execute("DELETE FROM inbound_seen WHERE seen_at < ?", (now - _DEDUP_TTL_SECONDS,))
+        conn.commit()
+        if cur.rowcount:
+            logger.info("Inbound dedup store swept %d expired id(s)", cur.rowcount)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Inbound dedup store sweep failed")
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +324,9 @@ class BaseChannel(ABC):
         # Subject registry: auto-populated on first interaction
         self._known_subjects: dict[str, ChannelSubject] = {}
         self._on_new_subject: Callable[[ChannelSubject], None] | None = None
+
+        # Inbound idempotency fast path (the SQLite store is the authority)
+        self._dedup_recent: OrderedDict[str, float] = OrderedDict()
 
     @property
     def channel_id(self) -> str:
@@ -723,6 +797,58 @@ class BaseChannel(ABC):
     # =========================================================================
     # Message processing pipeline
     # =========================================================================
+
+    def is_duplicate(self, key: str, *, scope: str | None = None) -> bool:
+        """Return True when this inbound event has already been handled.
+
+        Call this from the platform's receive callback, **before** any parsing
+        or side effect (media download, group-context bookkeeping). ``key`` must
+        be the platform's stable message id.
+
+        The decision reads a persisted store, so an upstream retry that arrives
+        hours later — including across process restarts — is still recognised as
+        a duplicate. Fail-open: if the store is unavailable the message is
+        processed rather than silently dropped.
+
+        ``scope`` defaults to ``channel_type``, which is stable across restarts.
+        Do **not** pass ``channel_id`` here — it is a per-instance UUID.
+        """
+        if not key:
+            return False
+        scope = scope or self.channel_type
+        cached = scope + "\x00" + key
+        if cached in self._dedup_recent:
+            return True
+
+        now = time.time()
+        duplicate = False
+        try:
+            with _dedup_lock:
+                conn = _get_dedup_store()
+                hit = conn.execute(
+                    "SELECT 1 FROM inbound_seen WHERE scope = ? AND key = ? AND seen_at >= ?",
+                    (scope, key, now - _DEDUP_TTL_SECONDS),
+                ).fetchone()
+                if hit is not None:
+                    duplicate = True
+                else:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO inbound_seen(scope, key, seen_at) VALUES(?, ?, ?)",
+                        (scope, key, now),
+                    )
+                    conn.commit()
+                _sweep_dedup(now)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Inbound dedup store unavailable (scope=%s), failing open", scope)
+            duplicate = False
+
+        self._dedup_recent[cached] = now
+        while len(self._dedup_recent) > _DEDUP_RECENT_SIZE:
+            self._dedup_recent.popitem(last=False)
+
+        if duplicate:
+            logger.info("Duplicate inbound ignored (scope=%s key=%s)", scope, key)
+        return duplicate
 
     async def handle_inbound(self, raw_payload: object) -> None:
         """Run the shared inbound template around platform-specific delivery.

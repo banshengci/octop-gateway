@@ -9,7 +9,6 @@ import logging
 import mimetypes
 import re
 import uuid
-from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Self
 
@@ -96,7 +95,6 @@ class DiscordChannel(BaseChannel):
         self._ready = asyncio.Event()
         self._connection_session: str | None = None
         self._runtime_error: str | None = None
-        self._seen: OrderedDict[str, None] = OrderedDict()
 
     def _default_constraints(self) -> ChannelConstraints:
         return ChannelConstraints(typing_keepalive_interval=8.0, show_thinking=False, show_tool_hints=True)
@@ -214,15 +212,6 @@ class DiscordChannel(BaseChannel):
         self._ready.clear()
         self._connection_session = None
 
-    def _is_duplicate(self, message_id: str) -> bool:
-        if message_id in self._seen:
-            self._seen.move_to_end(message_id)
-            return True
-        self._seen[message_id] = None
-        if len(self._seen) > 1000:
-            self._seen.popitem(last=False)
-        return False
-
     async def on_message(self, message: Any) -> None:
         import discord
 
@@ -240,7 +229,7 @@ class DiscordChannel(BaseChannel):
                 or str(message.channel.id) in self._config.allowed_channel_ids
                 or str(getattr(message.channel, "parent_id", None)) in self._config.allowed_channel_ids
             )
-        if not allowed or self._is_duplicate(str(message.id)):
+        if not allowed or self.is_duplicate(str(message.id)):
             return
         if not message.content and not message.attachments:
             return
