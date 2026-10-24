@@ -10,7 +10,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import re
+import sqlite3
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -37,8 +40,22 @@ logger = logging.getLogger(__name__)
 # Feishu API base URL
 _API_BASE = "https://open.feishu.cn/open-apis"
 
-# Maximum number of message IDs to track for deduplication
+# Maximum number of message IDs to track in the in-process LRU (fast path only).
+# The authoritative dedup record lives in SQLite — see _is_duplicate().
 _DEDUP_MAX_SIZE = 2000
+
+# Feishu delivers events at-least-once: an unacknowledged push is retried on a
+# 20s / 5min / 1h / 6h ladder (cumulative ~7h05m15s). A process restart inside
+# that window used to erase the in-memory cache, so the same message_id was
+# treated as new and the whole turn ran again. Persist the IDs for longer than
+# the retry window instead.
+_DEDUP_DB_PATH = "~/.octop/inbound-dedup.sqlite"
+_DEDUP_TTL_SECONDS = 8 * 3600
+
+# Module-level store, shared by every channel instance in the process.
+_dedup_lock = threading.Lock()
+_dedup_conn: sqlite3.Connection | None = None
+_dedup_last_sweep = 0.0
 
 # Token refresh interval (1.5 hours, token valid for 2 hours)
 _TOKEN_REFRESH_INTERVAL = 5400
@@ -46,11 +63,53 @@ _TOKEN_REFRESH_INTERVAL = 5400
 # WebSocket health: detect dead threads / stuck reconnects and hard-restart.
 _WS_WATCHDOG_INTERVAL = 30.0
 _WS_RECONNECT_STALE_SECONDS = 180.0
-# No message/reconnect activity for this long while the thread looks "fine"
-# usually means the SDK receive loop died without firing reconnect hooks.
-_WS_ACTIVITY_STALE_SECONDS = 3600.0
+# "No inbound message for N seconds" is NOT a transport-health signal — an idle
+# connection is perfectly healthy, and lark-oapi's ping loop plus the websockets
+# ping_timeout already detect a genuinely dead socket. The original 3600s value
+# hard-restarted a healthy WebSocket once per idle hour (39 restarts/day in the
+# 2026-10-23 incident); every restart is a window where an in-flight event can
+# lose its ACK, which feeds the upstream retry ladder.
+# Kept as a last-resort net for "process alive but receiving nothing at all".
+_WS_ACTIVITY_STALE_SECONDS = 21600.0
 _WS_RESTART_BACKOFF_SECONDS = 5.0
 _WS_THREAD_JOIN_TIMEOUT = 10.0
+
+
+def _get_dedup_store() -> sqlite3.Connection:
+    """Open (once per process) the persistent dedup store."""
+    global _dedup_conn
+    if _dedup_conn is not None:
+        return _dedup_conn
+    path = os.path.expanduser(_DEDUP_DB_PATH)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS seen (message_id TEXT PRIMARY KEY, seen_at REAL NOT NULL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_at ON seen(seen_at)")
+    conn.commit()
+    _dedup_conn = conn
+    logger.info("Feishu dedup store ready: %s (ttl=%ss)", path, _DEDUP_TTL_SECONDS)
+    return conn
+
+
+def _sweep_dedup(now: float) -> None:
+    """Drop IDs older than the retry window. Runs at most once per 10 minutes."""
+    global _dedup_last_sweep
+    if now - _dedup_last_sweep < 600:
+        return
+    _dedup_last_sweep = now
+    try:
+        conn = _get_dedup_store()
+        cur = conn.execute("DELETE FROM seen WHERE seen_at < ?", (now - _DEDUP_TTL_SECONDS,))
+        conn.commit()
+        if cur.rowcount:
+            logger.info("Feishu dedup store swept %d expired id(s)", cur.rowcount)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Feishu dedup store sweep failed")
 
 
 @dataclass
@@ -582,17 +641,49 @@ class FeishuChannel(BaseChannel):
     # =========================================================================
 
     def _is_duplicate(self, message_id: str) -> bool:
-        """Check if a message_id has been seen recently.
+        """Return True when this message_id has already been handled.
 
-        Uses an OrderedDict as a bounded LRU cache to track IDs.
+        Fast path: the per-instance OrderedDict LRU (same as before).
+        Authoritative path: a SQLite store shared by all channel instances, so
+        an upstream retry that arrives hours later — including across process
+        restarts — is still recognised as a duplicate.
+
+        Fail-open: if the store is unavailable the message is processed rather
+        than silently dropped.
         """
         if message_id in self._seen_message_ids:
             return True
-        self._seen_message_ids[message_id] = time.time()
-        # Evict oldest entries when exceeding max size
+
+        now = time.time()
+        duplicate = False
+        try:
+            with _dedup_lock:
+                conn = _get_dedup_store()
+                hit = conn.execute(
+                    "SELECT 1 FROM seen WHERE message_id = ? AND seen_at >= ?",
+                    (message_id, now - _DEDUP_TTL_SECONDS),
+                ).fetchone()
+                if hit is not None:
+                    duplicate = True
+                else:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO seen(message_id, seen_at) VALUES(?, ?)",
+                        (message_id, now),
+                    )
+                    conn.commit()
+                _sweep_dedup(now)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Feishu dedup store unavailable, failing open")
+            duplicate = False
+
+        # Keep the original bounded-LRU behaviour for the in-process fast path.
+        self._seen_message_ids[message_id] = now
         while len(self._seen_message_ids) > _DEDUP_MAX_SIZE:
             self._seen_message_ids.popitem(last=False)
-        return False
+
+        if duplicate:
+            logger.info("Feishu duplicate message ignored (persistent store): %s", message_id)
+        return duplicate
 
     # =========================================================================
     # Sending
